@@ -12,6 +12,7 @@ class GraphImporterTests(unittest.TestCase):
     def test_extracts_case_number(self):
         self.assertEqual(extract_case_number("Дело № 1-108/2025", "fallback"), "1-108/2025")
         self.assertEqual(extract_case_number("Дело №\nПРИГОВОР", "fallback"), "fallback")
+        self.assertEqual(extract_case_number("номер в тексте отсутствует", "152320033 Протокол допроса"), "152320033")
 
     def test_parses_json_in_markdown_fence(self):
         self.assertEqual(parse_llm_json("```json\n{\"entities\": []}\n```"), {"entities": []})
@@ -22,6 +23,7 @@ class GraphImporterTests(unittest.TestCase):
             {"type": "unknown", "name": "не попадет"},
         ], "case", "document")
         self.assertEqual(entities[0]["label"], "Person")
+        self.assertEqual(entities[0]["properties"]["роль"], "свидетель")
         self.assertEqual(len(entities), 1)
 
 
