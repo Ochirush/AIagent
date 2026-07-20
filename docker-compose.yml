@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  neo4j:
+    image: neo4j:5.26.0-community
+    container_name: neo4j-ai-doznavatel
+    restart: unless-stopped
+    ports:
+      - "7474:7474"    # Web-интерфейс (Browser)
+      - "7687:7687"    # Bolt протокол (для подключения из Python)
+    environment:
+      - NEO4J_AUTH=neo4j/password123   # Логин: neo4j, Пароль: password123 (измени потом!)
+      - NEO4J_dbms.security.procedures.unrestricted=apoc.*
+      - NEO4JLABS_PLUGINS=["apoc"]
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      - neo4j_import:/import
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+  neo4j_import:

@@ -1,0 +1,38 @@
+{
+  "defendant": {
+    "full_name": null,
+    "birth_date": null,
+    "characteristics": []
+  },
+  "victims": [
+    {
+      "full_name": null,
+      "injuries": null
+    }
+  ],
+  "crime": {
+    "article": 105,
+    "part": 1,
+    "paragraphs": [],
+    "attempt": false,
+    "description": null
+  },
+  "sentence": {
+    "years": 0,
+    "months": 0,
+    "regime": null,
+    "additional": null
+  },
+  "court": {
+    "full_name": null,
+    "date": null,
+    "judge": null
+  },
+  "case_details": {
+    "date_of_crime": null,
+    "location": null,
+    "method": null
+  },
+  "witnesses": [],
+  "evidence": []
+}
