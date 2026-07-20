@@ -18,8 +18,14 @@ from neo4j import GraphDatabase
 
 NODE_TYPES = {"person": "Person", "case": "Case", "event": "Event", "location": "Location",
               "evidence": "Evidence", "document": "Document", "organization": "Organization", "time": "Time"}
-RELATION_TYPES = {"MENTIONED_IN", "BELONGS_TO_CASE", "PARTICIPATED_IN", "OCCURRED_AT", "OCCURRED_AT_TIME",
-                  "HAS_EVIDENCE", "WORKS_AT", "SOURCED_FROM", "RELATED_TO"}
+RELATION_TYPES = {
+    "PARTICIPATED_IN": "УЧАСТВОВАЛ_В",
+    "OCCURRED_AT": "ПРОИЗОШЛО_В",
+    "OCCURRED_AT_TIME": "ПРОИЗОШЛО_ВО_ВРЕМЯ",
+    "HAS_EVIDENCE": "ИМЕЕТ_ДОКАЗАТЕЛЬСТВО",
+    "WORKS_AT": "РАБОТАЕТ_В",
+    "RELATED_TO": "СВЯЗАН_С",
+}
 W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 
 
@@ -57,7 +63,12 @@ def extract_case_number(text: str, fallback: str) -> str:
     match = re.search(r"(?:уголовное\s+)?дело\s*№\s*([\w./-]+)", text, re.IGNORECASE)
     # OCR templates sometimes leave the number blank and put "ПРИГОВОР" on the
     # next line.  A case number must contain at least one digit.
-    return match.group(1) if match and re.search(r"\d", match.group(1)) else fallback
+    if match and re.search(r"\d", match.group(1)):
+        return match.group(1)
+    # Имена OCR-файлов обычно начинаются с номера дела. Не превращаем всё имя
+    # документа в номер дела, если номер не удалось найти в тексте.
+    fallback_match = re.match(r"\s*(\d[\w./-]*)", fallback)
+    return fallback_match.group(1) if fallback_match else fallback
 
 
 def parse_llm_json(response: str) -> dict[str, Any]:
@@ -80,10 +91,18 @@ class QwenExtractor:
     def extract(self, text: str, case_number: str, document_name: str) -> dict[str, Any]:
         prompt = f"""Ты извлекаешь факты из материалов уголовного дела. Не выдумывай факты.\n
 Дело: {case_number}\nДокумент: {document_name}\nТекст:\n{text}\n\nВерни только JSON следующей структуры:\n{{
-  "entities": [{{"type":"person|event|location|evidence|organization|time", "name":"строка", "properties":{{}}}}],
+  "entities": [{{"type":"person|event|location|evidence|organization|time", "name":"строка", "properties":{{"role":"роль лица в деле, только для person"}}}}],
   "relations": [{{"from":"точное name первой сущности", "type":"PARTICIPATED_IN|OCCURRED_AT|OCCURRED_AT_TIME|HAS_EVIDENCE|WORKS_AT|RELATED_TO", "to":"точное name второй сущности", "properties":{{"confidence":0.0, "quote":"короткая опора в документе"}}}}]
 }}\n
-Для каждого события укажи участников, место/время и вещественные доказательства, если это прямо следует из текста. Не включай сам документ и дело: они добавляются программой."""
+Обязательно создай отдельную сущность event для каждого значимого действия. Связи PARTICIPATED_IN,
+OCCURRED_AT и OCCURRED_AT_TIME должны начинаться или заканчиваться на event: не связывай человека
+напрямую с местом или временем. Для каждой персоны укажи properties.role, если роль прямо следует
+из документа: свидетель, потерпевший, подозреваемый, обвиняемый, подсудимый, следователь, адвокат,
+эксперт, переводчик, понятый или иное точное обозначение. Не делай юридический вывод по поведению:
+например, человек, которого кто-то ударил, не становится автоматически потерпевшим без прямого
+указания в документе. Извлекай также людей с неполным именем или кличкой, помечая это в properties.
+Для каждого события укажи участников, место/время и доказательства, если это прямо следует из текста.
+Не включай сам документ и дело: они добавляются программой."""
         response = requests.post(f"{self.url.rstrip('/')}/api/generate", json={
             "model": self.model, "prompt": prompt, "stream": False,
             "format": "json", "options": {"temperature": 0},
@@ -119,18 +138,26 @@ class Neo4jGraphWriter:
         tx.run("MERGE (c:Case {id:$id}) SET c.number=$number", id=case_id, number=case_number)
         tx.run("MERGE (d:Document {id:$id}) SET d.name=$name, d.path=$path, d.text=$text, d.imported_at=datetime()",
                id=document_id, name=source.name, path=str(source), text=text)
-        tx.run("MATCH (d:Document {id:$document_id}),(c:Case {id:$case_id}) MERGE (d)-[:BELONGS_TO_CASE]->(c)",
+        tx.run("MATCH (d:Document {id:$document_id}),(c:Case {id:$case_id}) MERGE (d)-[:ОТНОСИТСЯ_К_ДЕЛУ]->(c)",
                document_id=document_id, case_id=case_id)
         for entity in entities:
             tx.run(f"MERGE (n:{entity['label']} {{id:$id}}) SET n += $properties", id=entity["id"], properties=entity["properties"])
-            tx.run("MATCH (n {id:$entity_id}),(d:Document {id:$document_id}) MERGE (n)-[:MENTIONED_IN]->(d)",
+            tx.run("MATCH (n {id:$entity_id}),(d:Document {id:$document_id}) MERGE (n)-[:УПОМИНАЕТСЯ_В]->(d)",
                    entity_id=entity["id"], document_id=document_id)
-            tx.run("MATCH (n {id:$entity_id}),(c:Case {id:$case_id}) MERGE (n)-[:BELONGS_TO_CASE]->(c)",
-                   entity_id=entity["id"], case_id=case_id)
+            if entity["label"] == "Person":
+                tx.run("MATCH (n {id:$entity_id}),(c:Case {id:$case_id}) "
+                       "MERGE (n)-[r:УЧАСТВУЕТ_В_ДЕЛЕ]->(c) "
+                       "SET r.роль=$role",
+                       entity_id=entity["id"], case_id=case_id,
+                       role=entity["properties"].get("роль", "не установлена"))
+            else:
+                tx.run("MATCH (n {id:$entity_id}),(c:Case {id:$case_id}) "
+                       "MERGE (n)-[:ОТНОСИТСЯ_К_ДЕЛУ]->(c)",
+                       entity_id=entity["id"], case_id=case_id)
         for relation in relations:
-            rel_type = str(relation.get("type", "RELATED_TO")).upper()
+            rel_type = RELATION_TYPES.get(str(relation.get("type", "RELATED_TO")).upper())
             first, second = by_name.get(str(relation.get("from", "")).casefold()), by_name.get(str(relation.get("to", "")).casefold())
-            if first and second and rel_type in RELATION_TYPES:
+            if first and second and rel_type:
                 tx.run(f"MATCH (a {{id:$from_id}}),(b {{id:$to_id}}) MERGE (a)-[r:{rel_type}]->(b) SET r += $properties",
                        from_id=first["id"], to_id=second["id"], properties=relation.get("properties") or {})
 
@@ -146,6 +173,9 @@ class Neo4jGraphWriter:
             seen.add((entity_type, name.casefold()))
             properties = value.get("properties") if isinstance(value.get("properties"), dict) else {}
             properties = {key: item for key, item in properties.items() if isinstance(item, (str, int, float, bool, list))}
+            if entity_type == "person":
+                role = str(properties.pop("role", properties.get("роль", "не установлена"))).strip().lower()
+                properties["роль"] = role or "не установлена"
             properties.update({"name": name, "entity_type": entity_type})
             result.append({"id": stable_id(entity_type, case_id, document_id, name), "name": name,
                            "label": NODE_TYPES[entity_type], "properties": properties})
