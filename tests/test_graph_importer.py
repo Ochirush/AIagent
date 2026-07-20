@@ -26,6 +26,31 @@ class GraphImporterTests(unittest.TestCase):
         self.assertEqual(entities[0]["properties"]["роль"], "свидетель")
         self.assertEqual(len(entities), 1)
 
+    def test_normalises_subject_relations_and_event_direction(self):
+        entities = Neo4jGraphWriter._normalise_entities([
+            {"type": "person", "name": "Панова"},
+            {"type": "event", "name": "Звонок", "properties": {"topic": "происшествие"}},
+            {"type": "organization", "name": "АД Пластик"},
+        ], "case", "document")
+        by_name = {entity["name"].casefold(): entity for entity in entities}
+        relations = Neo4jGraphWriter._normalise_relations([
+            {"from": "Звонок", "type": "PARTICIPATED_IN", "to": "Панова",
+             "properties": {"event_role": "инициатор звонка"}},
+            {"from": "Панова", "type": "WORKED_AT", "to": "АД Пластик"},
+            {"from": "Панова", "type": "OCCURRED_AT_TIME", "to": "Звонок"},
+        ], by_name)
+        self.assertEqual([item["type"] for item in relations], ["УЧАСТВОВАЛ_В", "РАБОТАЛ_В"])
+        self.assertEqual(relations[0]["from_id"], by_name["панова"]["id"])
+        self.assertEqual(relations[0]["properties"]["роль_в_событии"], "инициатор звонка")
+
+    def test_people_are_merged_across_documents_but_events_are_not(self):
+        raw = [{"type": "person", "name": "Панова Наталья Александровна"},
+               {"type": "event", "name": "Допрос Пановой"}]
+        first = Neo4jGraphWriter._normalise_entities(raw, "case", "document-1")
+        second = Neo4jGraphWriter._normalise_entities(raw, "case", "document-2")
+        self.assertEqual(first[0]["id"], second[0]["id"])
+        self.assertNotEqual(first[1]["id"], second[1]["id"])
+
 
 if __name__ == "__main__":
     unittest.main()
