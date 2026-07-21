@@ -77,6 +77,26 @@ class GraphImporterTests(unittest.TestCase):
         self.assertEqual(post.call_count, 2)
         self.assertIsInstance(post.call_args.kwargs["json"]["format"], dict)
 
+    def test_splits_event_properties_out_of_location(self):
+        extraction = {"entities": [{
+            "type": "location", "name": "кабинет №301",
+            "properties": {"event_type": "допрос", "date": "05.03.2015",
+                           "description": "место проведения допроса"},
+        }], "relations": []}
+        expanded = QwenExtractor._expand_combined_event_locations(extraction)
+        self.assertEqual([item["type"] for item in expanded["entities"]], ["location", "event"])
+        self.assertEqual(expanded["relations"][0]["type"], "OCCURRED_AT")
+        self.assertEqual(expanded["relations"][0]["to"], "кабинет №301")
+
+    def test_accepts_russian_entity_type_alias(self):
+        entities = Neo4jGraphWriter._normalise_entities(
+            [{"type": "событие", "name": "Допрос", "properties": {}}], "case", "document")
+        self.assertEqual(entities[0]["label"], "Event")
+
+    def test_chunks_long_text_on_paragraph_boundaries(self):
+        chunks = QwenExtractor._chunk_text("первый абзац\nвторой абзац\nтретий абзац", limit=30)
+        self.assertEqual(chunks, ["первый абзац\nвторой абзац", "третий абзац"])
+
 
 if __name__ == "__main__":
     unittest.main()
