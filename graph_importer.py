@@ -109,8 +109,38 @@ class QwenExtractor:
     model: str
     url: str
 
+    def _generate(self, prompt: str) -> dict[str, Any]:
+        response = requests.post(f"{self.url.rstrip('/')}/api/generate", json={
+            "model": self.model, "prompt": prompt, "stream": False,
+            "format": "json", "options": {"temperature": 0, "num_ctx": 32768, "num_predict": 8192},
+        }, timeout=300)
+        response.raise_for_status()
+        return parse_llm_json(response.json()["response"])
+
+    @staticmethod
+    def _merge_extractions(*extractions: dict[str, Any]) -> dict[str, Any]:
+        entities, relations, seen_entities, seen_relations = [], [], set(), set()
+        for extraction in extractions:
+            for entity in extraction.get("entities", []):
+                if not isinstance(entity, dict):
+                    continue
+                key = (str(entity.get("type", "")).casefold(), str(entity.get("name", "")).strip().casefold())
+                if key not in seen_entities:
+                    seen_entities.add(key)
+                    entities.append(entity)
+            for relation in extraction.get("relations", []):
+                if not isinstance(relation, dict):
+                    continue
+                key = (str(relation.get("from", "")).strip().casefold(),
+                       str(relation.get("type", "")).upper(),
+                       str(relation.get("to", "")).strip().casefold())
+                if key not in seen_relations:
+                    seen_relations.add(key)
+                    relations.append(relation)
+        return {"entities": entities, "relations": relations}
+
     def extract(self, text: str, case_number: str, document_name: str) -> dict[str, Any]:
-        prompt = f"""Ты извлекаешь факты из материалов уголовного дела. Не выдумывай факты.\n
+        subject_prompt = f"""Ты извлекаешь факты из материалов уголовного дела. Не выдумывай факты.\n
 Дело: {case_number}\nДокумент: {document_name}\nТекст:\n{text}\n\nВерни только JSON следующей структуры:\n{{
   "entities": [{{"type":"person|event|location|evidence|organization|time", "name":"краткое уникальное название", "properties":{{"role":"процессуальная роль person", "event_type":"тип event", "date":"дата event", "time":"время event", "description":"что произошло", "topic":"тема разговора или звонка"}}}}],
   "relations": [{{"from":"точное name первой сущности", "type":"PARTICIPATED_IN|OCCURRED_AT|OCCURRED_AT_TIME|HAS_EVIDENCE|WORKS_AT|WORKED_AT|MARRIED_TO|PARENT_OF|CHILD_OF|RELATIVE_OF|LIVES_AT|KNOWS|RELATED_TO", "to":"точное name второй сущности", "properties":{{"event_role":"роль участника в событии", "confidence":0.0, "quote":"короткая дословная опора"}}}}]
@@ -138,12 +168,24 @@ LIVES_AT, WORKS_AT/WORKED_AT. Работодатель всегда должен
 указания в документе. Извлекай также людей с неполным именем или кличкой, помечая это в properties.
 Для каждого события укажи участников, место/время и доказательства, если это прямо следует из текста.
 Не включай сам документ и дело: они добавляются программой."""
-        response = requests.post(f"{self.url.rstrip('/')}/api/generate", json={
-            "model": self.model, "prompt": prompt, "stream": False,
-            "format": "json", "options": {"temperature": 0, "num_ctx": 32768, "num_predict": 8192},
-        }, timeout=300)
-        response.raise_for_status()
-        return parse_llm_json(response.json()["response"])
+        event_prompt = f"""Повторно проанализируй весь документ, но сосредоточься только на действиях,
+местах и времени. Не выдумывай события. Для каждого явно описанного действия создай event, даже если
+точное время неизвестно. Для каждого явно указанного адреса или места создай location. Свяжи event с
+location через OCCURRED_AT, а с датой/временем через OCCURRED_AT_TIME. Всех названных участников
+свяжи с event через PARTICIPATED_IN и укажи properties.event_role. Используй наиболее полное ФИО.
+
+Дело: {case_number}
+Документ: {document_name}
+Текст:
+{text}
+
+Верни только JSON:
+{{
+  "entities": [{{"type":"person|event|location|time", "name":"краткое уникальное название", "properties":{{"event_type":"тип события", "date":"дата", "time":"время", "description":"что произошло", "topic":"тема разговора", "address":"полный адрес места"}}}}],
+  "relations": [{{"from":"точное name", "type":"PARTICIPATED_IN|OCCURRED_AT|OCCURRED_AT_TIME", "to":"точное name", "properties":{{"event_role":"роль участника", "confidence":0.0, "quote":"опора в тексте"}}}}]
+}}
+Направления обязательны: person -> event, event -> location, event -> time."""
+        return self._merge_extractions(self._generate(subject_prompt), self._generate(event_prompt))
 
 
 class Neo4jGraphWriter:
@@ -157,6 +199,7 @@ class Neo4jGraphWriter:
         with self.driver.session() as session:
             for label in NODE_TYPES.values():
                 session.run(f"CREATE CONSTRAINT {label.lower()}_id IF NOT EXISTS FOR (n:{label}) REQUIRE n.id IS UNIQUE")
+            session.run("CREATE CONSTRAINT case_number IF NOT EXISTS FOR (c:Case) REQUIRE c.number IS UNIQUE")
 
     def write(self, source: Path, text: str, case_number: str, extraction: dict[str, Any]) -> None:
         document_id = stable_id("document", str(source.resolve()))
@@ -170,25 +213,25 @@ class Neo4jGraphWriter:
     @staticmethod
     def _write_transaction(tx: Any, document_id: str, case_id: str, source: Path, text: str, case_number: str,
                            entities: list[dict[str, Any]], relations: list[dict[str, Any]], by_name: dict[str, dict[str, Any]]) -> None:
-        tx.run("MERGE (c:Case {id:$id}) SET c.number=$number", id=case_id, number=case_number)
+        tx.run("MERGE (c:Case {number:$number}) ON CREATE SET c.id=$id", id=case_id, number=case_number)
         tx.run("MERGE (d:Document {id:$id}) SET d.name=$name, d.path=$path, d.text=$text, d.imported_at=datetime()",
                id=document_id, name=source.name, path=str(source), text=text)
-        tx.run("MATCH (d:Document {id:$document_id}),(c:Case {id:$case_id}) MERGE (d)-[:ОТНОСИТСЯ_К_ДЕЛУ]->(c)",
-               document_id=document_id, case_id=case_id)
+        tx.run("MATCH (d:Document {id:$document_id}),(c:Case {number:$case_number}) MERGE (d)-[:ОТНОСИТСЯ_К_ДЕЛУ]->(c)",
+               document_id=document_id, case_number=case_number)
         for entity in entities:
             tx.run(f"MERGE (n:{entity['label']} {{id:$id}}) SET n += $properties", id=entity["id"], properties=entity["properties"])
             tx.run("MATCH (n {id:$entity_id}),(d:Document {id:$document_id}) MERGE (n)-[:УПОМИНАЕТСЯ_В]->(d)",
                    entity_id=entity["id"], document_id=document_id)
             if entity["label"] == "Person":
-                tx.run("MATCH (n {id:$entity_id}),(c:Case {id:$case_id}) "
+                tx.run("MATCH (n {id:$entity_id}),(c:Case {number:$case_number}) "
                        "MERGE (n)-[r:УЧАСТВУЕТ_В_ДЕЛЕ]->(c) "
                        "SET r.роль=$role",
-                       entity_id=entity["id"], case_id=case_id,
+                       entity_id=entity["id"], case_number=case_number,
                        role=entity["properties"].get("роль", "не установлена"))
             else:
-                tx.run("MATCH (n {id:$entity_id}),(c:Case {id:$case_id}) "
+                tx.run("MATCH (n {id:$entity_id}),(c:Case {number:$case_number}) "
                        "MERGE (n)-[:ОТНОСИТСЯ_К_ДЕЛУ]->(c)",
-                       entity_id=entity["id"], case_id=case_id)
+                       entity_id=entity["id"], case_number=case_number)
         for relation in Neo4jGraphWriter._normalise_relations(relations, by_name):
             tx.run(f"MATCH (a {{id:$from_id}}),(b {{id:$to_id}}) MERGE (a)-[r:{relation['type']}]->(b) SET r += $properties",
                    from_id=relation["from_id"], to_id=relation["to_id"], properties=relation["properties"])
