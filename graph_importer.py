@@ -48,6 +48,14 @@ RELATION_TYPES = {
     "KNOWS": "ЗНАКОМ_С",
     "RELATED_TO": "СВЯЗАН_С",
 }
+RELATION_TYPE_ALIASES = {
+    "УЧАСТВОВАЛ_В": "PARTICIPATED_IN", "УЧАСТВОВАЛА_В": "PARTICIPATED_IN",
+    "УЧАСТНИК_СОБЫТИЯ": "PARTICIPATED_IN", "ПРОИЗОШЛО_В": "OCCURRED_AT",
+    "ПРОИЗОШЛО_ВО_ВРЕМЯ": "OCCURRED_AT_TIME", "РАБОТАЕТ_В": "WORKS_AT",
+    "РАБОТАЛ_В": "WORKED_AT", "СУПРУГ_СУПРУГА": "MARRIED_TO",
+    "РОДИТЕЛЬ": "PARENT_OF", "РЕБЕНОК": "CHILD_OF", "РОДСТВЕННИК": "RELATIVE_OF",
+    "ПРОЖИВАЕТ_В": "LIVES_AT", "ЗНАКОМ_С": "KNOWS", "СВЯЗАН_С": "RELATED_TO",
+}
 RELATION_ENDPOINTS = {
     "PARTICIPATED_IN": ("person", "event"),
     "OCCURRED_AT": ("event", "location"),
@@ -244,7 +252,9 @@ class QwenExtractor:
 
     @staticmethod
     def _has_event_participants(extraction: dict[str, Any]) -> bool:
-        return any(isinstance(relation, dict) and str(relation.get("type", "")).upper() == "PARTICIPATED_IN"
+        return any(isinstance(relation, dict) and
+                   RELATION_TYPE_ALIASES.get(str(relation.get("type", "")).upper(),
+                                             str(relation.get("type", "")).upper()) == "PARTICIPATED_IN"
                    for relation in extraction.get("relations", []))
 
     def extract(self, text: str, case_number: str, document_name: str) -> dict[str, Any]:
@@ -349,6 +359,37 @@ class Neo4jGraphWriter:
                                   extraction.get("relations", []), by_name)
 
     @staticmethod
+    def _normalised_name(value: str) -> list[str]:
+        value = re.sub(r"\([^)]*\)", " ", value.casefold().replace("ё", "е"))
+        return re.findall(r"[а-яa-z0-9]+", value)
+
+    @staticmethod
+    def _resolve_entity(value: Any, by_name: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+        raw = str(value or "").strip()
+        exact = by_name.get(raw.casefold())
+        if exact:
+            return exact
+        query = Neo4jGraphWriter._normalised_name(raw)
+        if not query:
+            return None
+        candidates = []
+        for entity in {item["id"]: item for item in by_name.values()}.values():
+            candidate = Neo4jGraphWriter._normalised_name(entity["name"])
+            if query == candidate:
+                candidates.append(entity)
+                continue
+            entity_type = entity["properties"].get("entity_type")
+            if entity_type == "person" and query[0] == candidate[0]:
+                initials_match = all(index < len(candidate) and token[0] == candidate[index][0]
+                                     for index, token in enumerate(query[1:], start=1))
+                if initials_match:
+                    candidates.append(entity)
+            elif entity_type == "event" and (candidate[:len(query)] == query or query[:len(candidate)] == candidate):
+                candidates.append(entity)
+        unique = {item["id"]: item for item in candidates}
+        return next(iter(unique.values())) if len(unique) == 1 else None
+
+    @staticmethod
     def _write_transaction(tx: Any, document_id: str, case_id: str, source: Path, text: str, case_number: str,
                            entities: list[dict[str, Any]], relations: list[dict[str, Any]], by_name: dict[str, dict[str, Any]]) -> None:
         tx.run("MERGE (c:Case {number:$number}) ON CREATE SET c.id=$id", id=case_id, number=case_number)
@@ -380,11 +421,12 @@ class Neo4jGraphWriter:
         for value in raw:
             if not isinstance(value, dict):
                 continue
-            source = by_name.get(str(value.get("from", "")).strip().casefold())
-            target = by_name.get(str(value.get("to", "")).strip().casefold())
+            source = Neo4jGraphWriter._resolve_entity(value.get("from"), by_name)
+            target = Neo4jGraphWriter._resolve_entity(value.get("to"), by_name)
             source_type = source and source["properties"]["entity_type"]
             target_type = target and target["properties"]["entity_type"]
             raw_type = str(value.get("type", "RELATED_TO")).upper()
+            raw_type = RELATION_TYPE_ALIASES.get(raw_type, raw_type)
             expected = RELATION_ENDPOINTS.get(raw_type)
             if not source or not target or raw_type not in RELATION_TYPES:
                 continue
