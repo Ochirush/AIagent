@@ -1,5 +1,6 @@
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 from graph_importer import Neo4jGraphWriter, QwenExtractor, extract_case_number, parse_llm_json, read_document
 
@@ -61,6 +62,20 @@ class GraphImporterTests(unittest.TestCase):
         )
         self.assertEqual(len(merged["entities"]), 3)
         self.assertEqual(len(merged["relations"]), 1)
+
+    @patch("graph_importer.requests.post")
+    def test_retries_malformed_llm_json(self, post):
+        malformed = Mock()
+        malformed.raise_for_status.return_value = None
+        malformed.json.return_value = {"response": '{"entities": [}' }
+        valid = Mock()
+        valid.raise_for_status.return_value = None
+        valid.json.return_value = {"response": '{"entities": [], "relations": []}' }
+        post.side_effect = [malformed, valid]
+        result = QwenExtractor("qwen", "http://ollama")._generate("prompt")
+        self.assertEqual(result, {"entities": [], "relations": []})
+        self.assertEqual(post.call_count, 2)
+        self.assertIsInstance(post.call_args.kwargs["json"]["format"], dict)
 
 
 if __name__ == "__main__":
