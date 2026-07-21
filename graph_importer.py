@@ -47,6 +47,37 @@ RELATION_ENDPOINTS = {
     "LIVES_AT": ("person", "location"),
     "KNOWS": ("person", "person"),
 }
+EXTRACTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "entities": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "type": {"type": "string"},
+                    "name": {"type": "string"},
+                    "properties": {"type": "object"},
+                },
+                "required": ["type", "name", "properties"],
+            },
+        },
+        "relations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "from": {"type": "string"},
+                    "type": {"type": "string"},
+                    "to": {"type": "string"},
+                    "properties": {"type": "object"},
+                },
+                "required": ["from", "type", "to", "properties"],
+            },
+        },
+    },
+    "required": ["entities", "relations"],
+}
 W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 
 
@@ -110,12 +141,24 @@ class QwenExtractor:
     url: str
 
     def _generate(self, prompt: str) -> dict[str, Any]:
-        response = requests.post(f"{self.url.rstrip('/')}/api/generate", json={
-            "model": self.model, "prompt": prompt, "stream": False,
-            "format": "json", "options": {"temperature": 0, "num_ctx": 32768, "num_predict": 8192},
-        }, timeout=300)
-        response.raise_for_status()
-        return parse_llm_json(response.json()["response"])
+        last_error: Exception | None = None
+        retry_prompt = prompt
+        for attempt in range(2):
+            response = requests.post(f"{self.url.rstrip('/')}/api/generate", json={
+                "model": self.model, "prompt": retry_prompt, "stream": False,
+                "format": EXTRACTION_SCHEMA,
+                "options": {"temperature": 0, "num_ctx": 32768, "num_predict": 8192},
+            }, timeout=300)
+            response.raise_for_status()
+            raw_response = response.json()["response"]
+            try:
+                return parse_llm_json(raw_response)
+            except (json.JSONDecodeError, ValueError) as error:
+                last_error = error
+                retry_prompt = (prompt + "\n\nПРЕДЫДУЩИЙ ОТВЕТ СОДЕРЖАЛ ПОВРЕЖДЕННЫЙ JSON. "
+                                "Повтори извлечение. Верни строго один JSON-объект по заданной схеме: "
+                                "без Markdown, комментариев и неэкранированных кавычек внутри строк.")
+        raise ValueError(f"Qwen дважды вернул некорректный JSON: {last_error}") from last_error
 
     @staticmethod
     def _merge_extractions(*extractions: dict[str, Any]) -> dict[str, Any]:
