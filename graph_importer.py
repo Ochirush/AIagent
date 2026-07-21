@@ -18,6 +18,13 @@ from neo4j import GraphDatabase
 
 NODE_TYPES = {"person": "Person", "case": "Case", "event": "Event", "location": "Location",
               "evidence": "Evidence", "document": "Document", "organization": "Organization", "time": "Time"}
+ENTITY_TYPE_ALIASES = {
+    "человек": "person", "персона": "person", "лицо": "person",
+    "событие": "event", "действие": "event",
+    "место": "location", "адрес": "location",
+    "организация": "organization", "компания": "organization",
+    "время": "time", "дата": "time", "доказательство": "evidence",
+}
 RELATION_TYPES = {
     "PARTICIPATED_IN": "УЧАСТВОВАЛ_В",
     "OCCURRED_AT": "ПРОИЗОШЛО_В",
@@ -182,6 +189,53 @@ class QwenExtractor:
                     relations.append(relation)
         return {"entities": entities, "relations": relations}
 
+    @staticmethod
+    def _expand_combined_event_locations(extraction: dict[str, Any]) -> dict[str, Any]:
+        """Split Qwen records that incorrectly combine an event and its location."""
+        entities = list(extraction.get("entities", []))
+        relations = list(extraction.get("relations", []))
+        additions = []
+        for entity in entities:
+            if not isinstance(entity, dict) or str(entity.get("type", "")).casefold() not in {"location", "место", "адрес"}:
+                continue
+            properties = entity.get("properties") if isinstance(entity.get("properties"), dict) else {}
+            event_type = str(properties.get("event_type", properties.get("тип", ""))).strip()
+            if not event_type:
+                continue
+            location_name = str(entity.get("name", "")).strip()
+            description = str(properties.get("description", properties.get("описание", ""))).strip()
+            event_name = f"{event_type.capitalize()} — {location_name}"
+            event_properties = {
+                key: properties[key] for key in ("event_type", "date", "time", "description", "topic", "result")
+                if key in properties
+            }
+            additions.append({"type": "event", "name": event_name, "properties": event_properties})
+            relations.append({"from": event_name, "type": "OCCURRED_AT", "to": location_name,
+                              "properties": {"confidence": 1.0, "quote": description}})
+        return QwenExtractor._merge_extractions({"entities": entities + additions, "relations": relations})
+
+    @staticmethod
+    def _chunk_text(text: str, limit: int = 4500) -> list[str]:
+        chunks, current = [], []
+        current_size = 0
+        for paragraph in text.splitlines():
+            paragraph = paragraph.strip()
+            if not paragraph:
+                continue
+            if current and current_size + len(paragraph) + 1 > limit:
+                chunks.append("\n".join(current))
+                current, current_size = [], 0
+            current.append(paragraph)
+            current_size += len(paragraph) + 1
+        if current:
+            chunks.append("\n".join(current))
+        return chunks
+
+    @staticmethod
+    def _has_event_participants(extraction: dict[str, Any]) -> bool:
+        return any(isinstance(relation, dict) and str(relation.get("type", "")).upper() == "PARTICIPATED_IN"
+                   for relation in extraction.get("relations", []))
+
     def extract(self, text: str, case_number: str, document_name: str) -> dict[str, Any]:
         subject_prompt = f"""Ты извлекаешь факты из материалов уголовного дела. Не выдумывай факты.\n
 Дело: {case_number}\nДокумент: {document_name}\nТекст:\n{text}\n\nВерни только JSON следующей структуры:\n{{
@@ -211,7 +265,8 @@ LIVES_AT, WORKS_AT/WORKED_AT. Работодатель всегда должен
 указания в документе. Извлекай также людей с неполным именем или кличкой, помечая это в properties.
 Для каждого события укажи участников, место/время и доказательства, если это прямо следует из текста.
 Не включай сам документ и дело: они добавляются программой."""
-        event_prompt = f"""Повторно проанализируй весь документ, но сосредоточься только на действиях,
+        def build_event_prompt(fragment: str) -> str:
+            return f"""Проанализируй текст, но сосредоточься только на действиях,
 местах и времени. Не выдумывай события. Для каждого явно описанного действия создай event, даже если
 точное время неизвестно. Для каждого явно указанного адреса или места создай location. Свяжи event с
 location через OCCURRED_AT, а с датой/временем через OCCURRED_AT_TIME. Всех названных участников
@@ -220,15 +275,24 @@ location через OCCURRED_AT, а с датой/временем через OC
 Дело: {case_number}
 Документ: {document_name}
 Текст:
-{text}
+{fragment}
 
 Верни только JSON:
 {{
   "entities": [{{"type":"person|event|location|time", "name":"краткое уникальное название", "properties":{{"event_type":"тип события", "date":"дата", "time":"время", "description":"что произошло", "topic":"тема разговора", "address":"полный адрес места"}}}}],
   "relations": [{{"from":"точное name", "type":"PARTICIPATED_IN|OCCURRED_AT|OCCURRED_AT_TIME", "to":"точное name", "properties":{{"event_role":"роль участника", "confidence":0.0, "quote":"опора в тексте"}}}}]
 }}
+Каждое событие и каждое место обязаны быть ОТДЕЛЬНЫМИ элементами массива entities. Не помещай
+event_type, date, time, description или topic в properties сущности location.
 Направления обязательны: person -> event, event -> location, event -> time."""
-        return self._merge_extractions(self._generate(subject_prompt), self._generate(event_prompt))
+
+        subject = self._generate(subject_prompt)
+        focused = self._generate(build_event_prompt(text))
+        merged = self._expand_combined_event_locations(self._merge_extractions(subject, focused))
+        if not self._has_event_participants(merged):
+            chunk_results = [self._generate(build_event_prompt(chunk)) for chunk in self._chunk_text(text)]
+            merged = self._expand_combined_event_locations(self._merge_extractions(merged, *chunk_results))
+        return merged
 
 
 class Neo4jGraphWriter:
@@ -319,6 +383,7 @@ class Neo4jGraphWriter:
             if not isinstance(value, dict):
                 continue
             entity_type, name = str(value.get("type", "")).lower(), str(value.get("name", "")).strip()
+            entity_type = ENTITY_TYPE_ALIASES.get(entity_type, entity_type)
             if entity_type not in NODE_TYPES or not name or (entity_type, name.casefold()) in seen:
                 continue
             seen.add((entity_type, name.casefold()))
