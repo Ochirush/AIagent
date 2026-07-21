@@ -106,6 +106,20 @@ class GraphImporterTests(unittest.TestCase):
         event = next(item for item in expanded["entities"] if item["type"] == "event")
         self.assertEqual(event["properties"]["event_type"], "избиение")
 
+    def test_accepts_russian_participation_relation_and_resolves_initials(self):
+        entities = Neo4jGraphWriter._normalise_entities([
+            {"type": "person", "name": "Панова Наталья Александровна"},
+            {"type": "event", "name": "Допрос — кабинет №301"},
+        ], "case", "document")
+        by_name = {entity["name"].casefold(): entity for entity in entities}
+        relations = Neo4jGraphWriter._normalise_relations([{
+            "from": "Панова Н.А.", "type": "УЧАСТВОВАЛА_В", "to": "Допрос",
+            "properties": {"event_role": "свидетель"},
+        }], by_name)
+        self.assertEqual(len(relations), 1)
+        self.assertEqual(relations[0]["type"], "УЧАСТВОВАЛ_В")
+        self.assertEqual(relations[0]["properties"]["роль_в_событии"], "свидетель")
+
     def test_accepts_russian_entity_type_alias(self):
         entities = Neo4jGraphWriter._normalise_entities(
             [{"type": "событие", "name": "Допрос", "properties": {}}], "case", "document")
