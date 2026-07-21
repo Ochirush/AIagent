@@ -1,7 +1,7 @@
 import unittest
 from pathlib import Path
 
-from graph_importer import Neo4jGraphWriter, extract_case_number, parse_llm_json, read_document
+from graph_importer import Neo4jGraphWriter, QwenExtractor, extract_case_number, parse_llm_json, read_document
 
 
 class GraphImporterTests(unittest.TestCase):
@@ -50,6 +50,17 @@ class GraphImporterTests(unittest.TestCase):
         second = Neo4jGraphWriter._normalise_entities(raw, "case", "document-2")
         self.assertEqual(first[0]["id"], second[0]["id"])
         self.assertNotEqual(first[1]["id"], second[1]["id"])
+
+    def test_merges_focused_event_pass_without_duplicates(self):
+        merged = QwenExtractor._merge_extractions(
+            {"entities": [{"type": "person", "name": "Панова"}], "relations": []},
+            {"entities": [{"type": "person", "name": "Панова"},
+                          {"type": "event", "name": "Избиение"},
+                          {"type": "location", "name": "ул. Плеханова"}],
+             "relations": [{"from": "Избиение", "type": "OCCURRED_AT", "to": "ул. Плеханова"}]},
+        )
+        self.assertEqual(len(merged["entities"]), 3)
+        self.assertEqual(len(merged["relations"]), 1)
 
 
 if __name__ == "__main__":
