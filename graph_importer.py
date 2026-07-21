@@ -25,6 +25,14 @@ ENTITY_TYPE_ALIASES = {
     "организация": "organization", "компания": "organization",
     "время": "time", "дата": "time", "доказательство": "evidence",
 }
+EVENT_KEYWORDS = {
+    "допрос": "допрос", "изби": "избиение", "удар": "нанесение удара",
+    "звон": "звонок", "разговор": "разговор", "встреч": "встреча",
+    "конфликт": "конфликт", "напад": "нападение", "оскорб": "оскорбление",
+    "удерж": "удержание", "задерж": "задержание", "предъявлен": "предъявление",
+    "поезд": "поездка", "прибыл": "прибытие", "приех": "прибытие",
+    "вызов": "вызов", "обращен": "обращение",
+}
 RELATION_TYPES = {
     "PARTICIPATED_IN": "УЧАСТВОВАЛ_В",
     "OCCURRED_AT": "ПРОИЗОШЛО_В",
@@ -199,16 +207,19 @@ class QwenExtractor:
             if not isinstance(entity, dict) or str(entity.get("type", "")).casefold() not in {"location", "место", "адрес"}:
                 continue
             properties = entity.get("properties") if isinstance(entity.get("properties"), dict) else {}
-            event_type = str(properties.get("event_type", properties.get("тип", ""))).strip()
-            if not event_type:
+            event_context = " ".join(str(properties.get(key, "")) for key in
+                                     ("event_type", "тип", "description", "описание", "topic", "тема")).casefold()
+            inferred_type = next((name for keyword, name in EVENT_KEYWORDS.items() if keyword in event_context), "")
+            if not inferred_type:
                 continue
             location_name = str(entity.get("name", "")).strip()
             description = str(properties.get("description", properties.get("описание", ""))).strip()
-            event_name = f"{event_type.capitalize()} — {location_name}"
+            event_name = f"{inferred_type.capitalize()} — {location_name}"
             event_properties = {
                 key: properties[key] for key in ("event_type", "date", "time", "description", "topic", "result")
                 if key in properties
             }
+            event_properties["event_type"] = inferred_type
             additions.append({"type": "event", "name": event_name, "properties": event_properties})
             relations.append({"from": event_name, "type": "OCCURRED_AT", "to": location_name,
                               "properties": {"confidence": 1.0, "quote": description}})
@@ -292,6 +303,26 @@ event_type, date, time, description или topic в properties сущности 
         if not self._has_event_participants(merged):
             chunk_results = [self._generate(build_event_prompt(chunk)) for chunk in self._chunk_text(text)]
             merged = self._expand_combined_event_locations(self._merge_extractions(merged, *chunk_results))
+        if not self._has_event_participants(merged):
+            people = [str(entity.get("name")) for entity in merged.get("entities", [])
+                      if ENTITY_TYPE_ALIASES.get(str(entity.get("type", "")).casefold(),
+                                                 str(entity.get("type", "")).casefold()) == "person"]
+            events = [str(entity.get("name")) for entity in merged.get("entities", [])
+                      if ENTITY_TYPE_ALIASES.get(str(entity.get("type", "")).casefold(),
+                                                 str(entity.get("type", "")).casefold()) == "event"]
+            if people and events:
+                participant_prompt = f"""Определи участников уже найденных событий по тексту документа.
+Не создавай новые сущности. Используй ИСКЛЮЧИТЕЛЬНО точные имена из списков ниже.
+
+Персоны: {json.dumps(people, ensure_ascii=False)}
+События: {json.dumps(events, ensure_ascii=False)}
+Текст: {text}
+
+Верни JSON {{"entities": [], "relations": [{{"from":"точное имя персоны",
+"type":"PARTICIPATED_IN", "to":"точное имя события", "properties":{{"event_role":"конкретная роль",
+"confidence":0.0, "quote":"короткая опора в тексте"}}}}]}}.
+Не связывай человека с событием, если участие не следует из текста."""
+                merged = self._merge_extractions(merged, self._generate(participant_prompt))
         return merged
 
 

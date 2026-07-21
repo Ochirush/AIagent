@@ -88,6 +88,24 @@ class GraphImporterTests(unittest.TestCase):
         self.assertEqual(expanded["relations"][0]["type"], "OCCURRED_AT")
         self.assertEqual(expanded["relations"][0]["to"], "кабинет №301")
 
+    def test_does_not_turn_static_location_category_into_event(self):
+        extraction = {"entities": [{
+            "type": "location", "name": "квартира №12",
+            "properties": {"event_type": "жилище", "description": "место проживания Пановой"},
+        }], "relations": []}
+        expanded = QwenExtractor._expand_combined_event_locations(extraction)
+        self.assertEqual(len(expanded["entities"]), 1)
+        self.assertEqual(expanded["relations"], [])
+
+    def test_recovers_action_name_from_location_description(self):
+        extraction = {"entities": [{
+            "type": "location", "name": "дом №44",
+            "properties": {"event_type": "место событий", "description": "место нахождения избитого мужчины"},
+        }], "relations": []}
+        expanded = QwenExtractor._expand_combined_event_locations(extraction)
+        event = next(item for item in expanded["entities"] if item["type"] == "event")
+        self.assertEqual(event["properties"]["event_type"], "избиение")
+
     def test_accepts_russian_entity_type_alias(self):
         entities = Neo4jGraphWriter._normalise_entities(
             [{"type": "событие", "name": "Допрос", "properties": {}}], "case", "document")
