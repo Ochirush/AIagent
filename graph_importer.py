@@ -207,12 +207,37 @@ class QwenExtractor:
 
     @staticmethod
     def _expand_combined_event_locations(extraction: dict[str, Any]) -> dict[str, Any]:
-        """Split Qwen records that incorrectly combine an event and its location."""
-        entities = list(extraction.get("entities", []))
+        """Recover events that Qwen incorrectly embeds into people or locations."""
+        entities = []
+        for value in extraction.get("entities", []):
+            if not isinstance(value, dict):
+                entities.append(value)
+                continue
+            copied = dict(value)
+            copied["properties"] = dict(value.get("properties", {})) if isinstance(value.get("properties"), dict) else {}
+            entities.append(copied)
         relations = list(extraction.get("relations", []))
-        additions = []
+        additions: list[dict[str, Any]] = []
+        recovered_events: dict[tuple[str, str], str] = {}
+
+        # Reuse an event already returned by the focused extraction pass.
         for entity in entities:
-            if not isinstance(entity, dict) or str(entity.get("type", "")).casefold() not in {"location", "место", "адрес"}:
+            if not isinstance(entity, dict) or str(entity.get("type", "")).casefold() not in {"event", "событие", "действие"}:
+                continue
+            properties = entity.get("properties", {})
+            context = " ".join(str(properties.get(key, "")) for key in
+                               ("event_type", "тип", "description", "описание", "topic", "тема"))
+            context += " " + str(entity.get("name", ""))
+            inferred = next((name for keyword, name in EVENT_KEYWORDS.items() if keyword in context.casefold()), "")
+            if inferred:
+                recovered_events[(inferred, str(properties.get("date", properties.get("дата", ""))))] = str(entity.get("name"))
+
+        for entity in entities:
+            if not isinstance(entity, dict):
+                continue
+            entity_type = ENTITY_TYPE_ALIASES.get(str(entity.get("type", "")).casefold(),
+                                                  str(entity.get("type", "")).casefold())
+            if entity_type not in {"person", "location"}:
                 continue
             properties = entity.get("properties") if isinstance(entity.get("properties"), dict) else {}
             event_context = " ".join(str(properties.get(key, "")) for key in
@@ -220,17 +245,39 @@ class QwenExtractor:
             inferred_type = next((name for keyword, name in EVENT_KEYWORDS.items() if keyword in event_context), "")
             if not inferred_type:
                 continue
-            location_name = str(entity.get("name", "")).strip()
+            entity_name = str(entity.get("name", "")).strip()
             description = str(properties.get("description", properties.get("описание", ""))).strip()
-            event_name = f"{inferred_type.capitalize()} — {location_name}"
+            date = str(properties.get("date", properties.get("дата", ""))).strip()
+            event_key = (inferred_type, date)
+            event_name = recovered_events.get(event_key)
+            if not event_name:
+                suffix = entity_name if entity_type == "location" else date
+                event_name = f"{inferred_type.capitalize()} — {suffix}" if suffix else inferred_type.capitalize()
+                recovered_events[event_key] = event_name
             event_properties = {
                 key: properties[key] for key in ("event_type", "date", "time", "description", "topic", "result")
                 if key in properties
             }
             event_properties["event_type"] = inferred_type
             additions.append({"type": "event", "name": event_name, "properties": event_properties})
-            relations.append({"from": event_name, "type": "OCCURRED_AT", "to": location_name,
-                              "properties": {"confidence": 1.0, "quote": description}})
+            if entity_type == "location":
+                relations.append({"from": event_name, "type": "OCCURRED_AT", "to": entity_name,
+                                  "properties": {"confidence": 1.0, "quote": description}})
+            else:
+                role = "участник"
+                if re.search(r"\bизбил[аи]?\b|нан[её]с(?:ла)?\s+удар", description.casefold()):
+                    role = "наносил удары"
+                elif re.search(r"свидетел|видел|наблюдал", description.casefold()):
+                    role = "свидетель"
+                elif re.search(r"присутств", description.casefold()):
+                    role = "присутствовал"
+                relations.append({"from": entity_name, "type": "PARTICIPATED_IN", "to": event_name,
+                                  "properties": {"event_role": role, "confidence": 1.0,
+                                                 "quote": description}})
+
+            # Эти поля описывают событие, а не человека или место.
+            for key in ("event_type", "date", "time", "description", "topic", "result"):
+                properties.pop(key, None)
         return QwenExtractor._merge_extractions({"entities": entities + additions, "relations": relations})
 
     @staticmethod
@@ -458,6 +505,10 @@ class Neo4jGraphWriter:
             entity_type, name = str(value.get("type", "")).lower(), str(value.get("name", "")).strip()
             entity_type = ENTITY_TYPE_ALIASES.get(entity_type, entity_type)
             if entity_type not in NODE_TYPES or not name or (entity_type, name.casefold()) in seen:
+                continue
+            # Названия вроде ConsNonform — служебные токены Word/LLM, а не
+            # события русскоязычного документа.
+            if entity_type == "event" and not re.search(r"[А-Яа-яЁё]", name):
                 continue
             seen.add((entity_type, name.casefold()))
             properties = value.get("properties") if isinstance(value.get("properties"), dict) else {}
