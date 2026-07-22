@@ -1,4 +1,5 @@
 import unittest
+from tempfile import TemporaryDirectory
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -9,6 +10,13 @@ class GraphImporterTests(unittest.TestCase):
     def test_reads_docx_payload_with_doc_extension(self):
         text = read_document(Path("OCR_Результаты/3.doc"))
         self.assertIn("Дело № 1-108/2025", text)
+
+    def test_rejects_legacy_binary_doc_even_with_docx_extension(self):
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "renamed.docx"
+            path.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 64)
+            with self.assertRaisesRegex(ValueError, "старым бинарным Word DOC"):
+                read_document(path)
 
     def test_extracts_case_number(self):
         self.assertEqual(extract_case_number("Дело № 1-108/2025", "fallback"), "1-108/2025")
@@ -120,6 +128,21 @@ class GraphImporterTests(unittest.TestCase):
         self.assertEqual(len(participation), 2)
         self.assertEqual({item["to"] for item in participation}, {events[0]["name"]})
         self.assertNotIn("event_type", expanded["entities"][0]["properties"])
+
+    def test_merges_person_and_location_event_when_location_has_no_date(self):
+        extraction = {"entities": [
+            {"type": "person", "name": "Татаринцев Дмитрий", "properties": {
+                "event_type": "избиение", "date": "2015-02-11", "description": "Избил мужчину."}},
+            {"type": "location", "name": "г. Калуга, ул. Плеханова, д. 44", "properties": {
+                "event_type": "избиение", "description": "Место избиения."}},
+        ], "relations": []}
+        expanded = QwenExtractor._expand_combined_event_locations(extraction)
+        events = [item for item in expanded["entities"] if item["type"] == "event"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual({item["to"] for item in expanded["relations"]
+                          if item["type"] == "PARTICIPATED_IN"}, {events[0]["name"]})
+        self.assertEqual({item["from"] for item in expanded["relations"]
+                          if item["type"] == "OCCURRED_AT"}, {events[0]["name"]})
 
     def test_rejects_non_cyrillic_event_artifact(self):
         entities = Neo4jGraphWriter._normalise_entities(
