@@ -106,6 +106,26 @@ class GraphImporterTests(unittest.TestCase):
         event = next(item for item in expanded["entities"] if item["type"] == "event")
         self.assertEqual(event["properties"]["event_type"], "избиение")
 
+    def test_recovers_one_shared_event_from_person_properties(self):
+        extraction = {"entities": [
+            {"type": "person", "name": "Татаринцев Дмитрий", "properties": {
+                "event_type": "избиение", "date": "2015-02-11", "description": "Избил мужчину."}},
+            {"type": "person", "name": "Леонов Юрий", "properties": {
+                "event_type": "избиение", "date": "2015-02-11", "description": "Присутствовал при избиении."}},
+        ], "relations": []}
+        expanded = QwenExtractor._expand_combined_event_locations(extraction)
+        events = [item for item in expanded["entities"] if item["type"] == "event"]
+        participation = [item for item in expanded["relations"] if item["type"] == "PARTICIPATED_IN"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(len(participation), 2)
+        self.assertEqual({item["to"] for item in participation}, {events[0]["name"]})
+        self.assertNotIn("event_type", expanded["entities"][0]["properties"])
+
+    def test_rejects_non_cyrillic_event_artifact(self):
+        entities = Neo4jGraphWriter._normalise_entities(
+            [{"type": "event", "name": "ConsNonform", "properties": {}}], "case", "document")
+        self.assertEqual(entities, [])
+
     def test_accepts_russian_participation_relation_and_resolves_initials(self):
         entities = Neo4jGraphWriter._normalise_entities([
             {"type": "person", "name": "Панова Наталья Александровна"},
