@@ -125,11 +125,22 @@ def read_document(path: Path) -> str:
         pass
 
     raw = path.read_bytes()
+    # Старый бинарный Word DOC (OLE Compound File) нельзя читать как обычный
+    # текст. Расширение иногда вручную меняют на .docx, но формат от этого не
+    # меняется: в Qwen попадали NUL-байты и строки вроде Normal.dotm.
+    if raw.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+        raise ValueError(
+            f"{path} является старым бинарным Word DOC, даже если имеет расширение .docx. "
+            "Откройте файл в Word или LibreOffice и сохраните как настоящий DOCX."
+        )
     for encoding in ("utf-8", "cp1251", "koi8-r"):
         text = raw.decode(encoding, errors="ignore")
         if text.lstrip().startswith("{\\rtf"):
             text = re.sub(r"\\'[0-9a-fA-F]{2}|\\[a-zA-Z]+-?\d* ?|[{}]", " ", text)
-        if re.search(r"[А-Яа-яЁё]", text):
+        control_count = sum(character == "\x00" or
+                            (ord(character) < 32 and character not in "\r\n\t")
+                            for character in text)
+        if re.search(r"[А-Яа-яЁё]", text) and control_count <= max(3, len(text) // 100):
             return re.sub(r"\s+", " ", text).strip()
     raise ValueError(f"Не удалось извлечь текст из {path}")
 
@@ -220,6 +231,17 @@ class QwenExtractor:
         additions: list[dict[str, Any]] = []
         recovered_events: dict[tuple[str, str], str] = {}
 
+        def find_recovered_event(event_type: str, date: str) -> str | None:
+            exact = recovered_events.get((event_type, date))
+            if exact:
+                return exact
+            same_type = {name for (known_type, _), name in recovered_events.items()
+                         if known_type == event_type}
+            # Qwen часто указывает дату в Person, но не повторяет её в Location
+            # (или наоборот). Если событие этого типа одно, это неполные версии
+            # одного факта, а не два разных события.
+            return next(iter(same_type)) if len(same_type) == 1 else None
+
         # Reuse an event already returned by the focused extraction pass.
         for entity in entities:
             if not isinstance(entity, dict) or str(entity.get("type", "")).casefold() not in {"event", "событие", "действие"}:
@@ -249,11 +271,11 @@ class QwenExtractor:
             description = str(properties.get("description", properties.get("описание", ""))).strip()
             date = str(properties.get("date", properties.get("дата", ""))).strip()
             event_key = (inferred_type, date)
-            event_name = recovered_events.get(event_key)
+            event_name = find_recovered_event(inferred_type, date)
             if not event_name:
                 suffix = entity_name if entity_type == "location" else date
                 event_name = f"{inferred_type.capitalize()} — {suffix}" if suffix else inferred_type.capitalize()
-                recovered_events[event_key] = event_name
+            recovered_events[event_key] = event_name
             event_properties = {
                 key: properties[key] for key in ("event_type", "date", "time", "description", "topic", "result")
                 if key in properties
